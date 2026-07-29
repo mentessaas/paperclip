@@ -17138,6 +17138,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             source: "scheduler",
             reason: "interval_elapsed",
             now: now.toISOString(),
+            // Periodic heartbeats are lightweight orchestration checks. Agents
+            // keep their primary adapter model for issue-assigned work; the
+            // runtime model-profile resolver applies the configured cheap
+            // lane only to this timer wake.
+            modelProfile: "cheap",
           },
         });
         if (run) enqueued += 1;
