@@ -37,6 +37,8 @@ import {
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
+  createIssueCompletionCommitProofSchema,
+  createIssueCompletionPeerVerificationProofSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
@@ -111,6 +113,7 @@ import {
   issueApprovalService,
   issueRecoveryActionService,
   issueThreadInteractionService,
+  completionProofService,
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
@@ -2608,6 +2611,7 @@ export function issueRoutes(
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
+  const completionProofsSvc = completionProofService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
@@ -3272,6 +3276,46 @@ export function issueRoutes(
         "scheduled_issue_monitor",
       ],
     });
+  }
+
+  /**
+   * IssueCompletionProof gate (ZAL-86). Runs at `in_review -> done` transitions
+   * for code-bearing issues. Rejects the transition with a 422 unless the
+   * runtime finds:
+   *   - a non-superseded `commit` proof attached to the issue
+   *   - whose SHA resolves via `git cat-file -t` + `git log -1 --format=%H`
+   *     against the author `repoPath`
+   *   - a non-superseded `peer_verification` proof for the same SHA, from a
+   *     different agent and a different worktree, submitted within the 60s
+   *     freshness window
+   *
+   * If `recovery.pause.codeGates` is set, every transition that would
+   * trigger an implicit recovery-action auto-close is rejected with
+   * `RecoveryPausedUntilGitGate` until C-4 removes the placeholder.
+   */
+  async function assertIssueCompletionProofGate(input: {
+    existing: { id: string; companyId: string; status: string };
+    updateFields: Record<string, unknown>;
+  }) {
+    const nextStatus = typeof input.updateFields.status === "string"
+      ? input.updateFields.status
+      : input.existing.status;
+    if (input.existing.status === "done" || nextStatus !== "done") return;
+
+    // C-4 placeholder: read once from the in-process flag. The flag is not
+    // wired to settings yet; the production cutoff happens in ZAL-90.
+    const recoveryPauseFlag = process.env.PAPERCLIP_RECOVERY_PAUSE_CODE_GATES === "true";
+
+    const verdict = await completionProofsSvc.verifyAtTransition(input.existing.id, {
+      recoveryPauseFlag,
+    });
+    if (verdict) {
+      throw unprocessable(verdict.message, {
+        code: verdict.code,
+        proofId: verdict.proofId,
+        issue: "Anti-spoofing SHA gate rejected this transition (ZAL-86)",
+      });
+    }
   }
 
   async function logExpiredRequestConfirmations(input: {
@@ -5787,6 +5831,68 @@ export function issueRoutes(
     res.json(workProducts);
   });
 
+  router.get("/issues/:id/completion-proofs", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const kind = typeof req.query.kind === "string" ? (req.query.kind as "commit" | "peer_verification") : undefined;
+    const proofs = await completionProofsSvc.listForIssue(issue.id, { kind });
+    res.json(proofs);
+  });
+
+  router.post("/issues/:id/completion-proofs/commits", validate(createIssueCompletionCommitProofSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    const proof = await completionProofsSvc.submitCommit(
+      { id: issue.id, companyId: issue.companyId },
+      req.body,
+      {
+        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+        userId: req.actor.type === "user" ? req.actor.actorId : null,
+        runId: req.actor.runId ?? null,
+      },
+    );
+    res.status(201).json(proof);
+  });
+
+  router.post("/issues/:id/completion-proofs/peer-verifications", validate(createIssueCompletionPeerVerificationProofSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (req.actor.type !== "agent") {
+      return;
+    }
+    // Author worktree = the most recent commit proof's repoPath. If no
+    // commit proof exists yet, the peer cannot anchor its independence and
+    // the service rejects with ProofRequired.
+    const commitProofs = await completionProofsSvc.listForIssue(issue.id, { kind: "commit" });
+    const authorWorktree = commitProofs[0]?.payload?.repoPath ?? null;
+    try {
+      const proof = await completionProofsSvc.submitPeerVerification(
+        { id: issue.id, companyId: issue.companyId },
+        req.body,
+        {
+          agentId: req.actor.agentId,
+          userId: null,
+          runId: req.actor.runId ?? null,
+        },
+        authorWorktree,
+      );
+      res.status(201).json(proof);
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code ?? "submit_failed";
+      if (code === "PeerNotIndependent") {
+        res.status(409).json({ error: (err as Error).message, code });
+        return;
+      }
+      throw err;
+    }
+  });
+
   router.get("/issues/:id/external-objects", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -8027,6 +8133,11 @@ export function issueRoutes(
       existing,
       updateFields,
       actorType: req.actor.type,
+    });
+
+    await assertIssueCompletionProofGate({
+      existing,
+      updateFields,
     });
 
     const nextAssigneeAgentId =
