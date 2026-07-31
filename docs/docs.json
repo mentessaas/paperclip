@@ -42,6 +42,7 @@
             "group": "Board Operator",
             "pages": [
               "guides/board-operator/dashboard",
+              "control-plane/issue-completion-proof-gate",
               "guides/board-operator/creating-a-company",
               "guides/board-operator/managing-agents",
               "guides/board-operator/org-structure",
