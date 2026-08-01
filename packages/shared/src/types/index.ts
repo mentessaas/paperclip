@@ -519,6 +519,13 @@ export type {
   AttachmentArtifactWorkProductMetadata,
 } from "./work-product.js";
 export type {
+  IssueCompletionProof,
+  IssueCompletionProofKind,
+  IssueCompletionCommitPayload,
+  IssueCompletionPeerVerificationPayload,
+  IssueCompletionProofErrorCode,
+} from "./completion-proof.js";
+export type {
   CompanyArtifact,
   CompanyArtifactAgentSummary,
   CompanyArtifactGroup,

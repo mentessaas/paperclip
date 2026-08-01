@@ -498,6 +498,13 @@ export {
 } from "./work-product.js";
 
 export {
+  createIssueCompletionCommitProofSchema,
+  createIssueCompletionPeerVerificationProofSchema,
+  type CreateIssueCompletionCommitProof,
+  type CreateIssueCompletionPeerVerificationProof,
+} from "./completion-proof.js";
+
+export {
   COMPANY_ARTIFACTS_DEFAULT_LIMIT,
   COMPANY_ARTIFACTS_MAX_LIMIT,
   COMPANY_ARTIFACTS_MAX_QUERY_LENGTH,

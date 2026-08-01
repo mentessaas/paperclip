@@ -74,6 +74,7 @@ export { issueThreadInteractions } from "./issue_thread_interactions.js";
 export { issueTreeHolds } from "./issue_tree_holds.js";
 export { issueTreeHoldMembers } from "./issue_tree_hold_members.js";
 export { issueExecutionDecisions } from "./issue_execution_decisions.js";
+export { issueCompletionProofs } from "./issue_completion_proofs.js";
 export { issueInboxArchives } from "./issue_inbox_archives.js";
 export { userInboxAgentPolicies } from "./user_inbox_agent_policies.js";
 export { inboxDismissals } from "./inbox_dismissals.js";
