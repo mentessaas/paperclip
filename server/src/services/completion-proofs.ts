@@ -161,6 +161,7 @@ export function completionProofService(db: Db) {
         runId: string | null;
       },
       authorWorktree: string | null,
+      authorAgentId: string | null = null,
     ) => {
       if (!actor.agentId) {
         throw new Error("Peer verification requires an agent actor");
@@ -171,7 +172,25 @@ export function completionProofService(db: Db) {
       if (!payload.peerWorktree || typeof payload.peerWorktree !== "string") {
         throw new Error("peerWorktree is required");
       }
-      if (authorWorktree && payload.peerWorktree === authorWorktree) {
+      if (!authorWorktree || !authorAgentId) {
+        // ZAL-89: a peer verification cannot be anchored without an
+        // author commit proof. Reject up-front (and the route will map
+        // this to 409 ProofRequired) rather than letting the row land
+        // and discovering the missing author at transition time.
+        const err = new Error(
+          "ProofRequired: no author commit proof to anchor peer verification against",
+        );
+        (err as Error & { code: string }).code = "ProofRequired";
+        throw err;
+      }
+      if (authorAgentId === actor.agentId) {
+        const err = new Error(
+          "PeerNotIndependent: peer agent is the same as the author agent",
+        );
+        (err as Error & { code: string }).code = "PeerNotIndependent";
+        throw err;
+      }
+      if (payload.peerWorktree === authorWorktree) {
         const err = new Error(
           "PeerNotIndependent: peerWorktree matches the author worktree",
         );
@@ -302,7 +321,7 @@ export function completionProofService(db: Db) {
       const ageMs = Date.now() - new Date(matchingPeer.submittedAt).getTime();
       if (ageMs > PEER_FRESHNESS_MS) {
         return {
-          code: "PeerStale",
+          code: "PeerVerificationStale",
           message: `peer verification is ${Math.round(ageMs / 1000)}s old`,
           proofId: matchingPeer.id,
         };

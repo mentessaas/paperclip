@@ -39,7 +39,7 @@ export interface IssueCompletionCommitPayload {
  *
  * `commandOutput` is the literal stdout/stderr of the executed commands. The
  * runtime applies a 60-second freshness window: if `submittedAt` is more than
- * 60 seconds older than the transition attempt, returns `409 PeerStale`.
+ * 60 seconds older than the transition attempt, returns `409 PeerVerificationStale`.
  *
  * The runtime re-runs the commands in the same shell as a sanity check; if
  * they would now fail (e.g. SHA deleted by `gc` or force-push) the transition
@@ -89,7 +89,7 @@ export type IssueCompletionProofErrorCode =
   | "ProofExpired"
   | "RepoNotRegistered"
   | "PeerNotIndependent"
-  | "PeerStale"
+  | "PeerVerificationStale"
   | "PeerVerificationRequired"
   | "CompletionProofTamper"
   | "RecoveryPausedUntilGitGate";

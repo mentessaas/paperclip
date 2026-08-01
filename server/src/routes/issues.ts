@@ -3279,15 +3279,20 @@ export function issueRoutes(
   }
 
   /**
-   * IssueCompletionProof gate (ZAL-86). Runs at `in_review -> done` transitions
-   * for code-bearing issues. Rejects the transition with a 422 unless the
-   * runtime finds:
+   * IssueCompletionProof gate (ZAL-86 / ZAL-89). Runs at `in_review -> done`
+   * transitions for code-bearing issues. Rejects the transition with a 409
+   * unless the runtime finds:
    *   - a non-superseded `commit` proof attached to the issue
    *   - whose SHA resolves via `git cat-file -t` + `git log -1 --format=%H`
    *     against the author `repoPath`
    *   - a non-superseded `peer_verification` proof for the same SHA, from a
    *     different agent and a different worktree, submitted within the 60s
    *     freshness window
+   *
+   * The 409 status (not 422) is the contract the ZAL-89 spec exposes to
+   * clients; the structured `code` field carries the exact reason
+   * (PeerVerificationRequired, PeerNotIndependent, PeerVerificationStale, ProofExpired,
+   * RecoveryPausedUntilGitGate, ...).
    *
    * If `recovery.pause.codeGates` is set, every transition that would
    * trigger an implicit recovery-action auto-close is rejected with
@@ -3310,10 +3315,10 @@ export function issueRoutes(
       recoveryPauseFlag,
     });
     if (verdict) {
-      throw unprocessable(verdict.message, {
+      throw conflict(verdict.message, {
         code: verdict.code,
         proofId: verdict.proofId,
-        issue: "Anti-spoofing SHA gate rejected this transition (ZAL-86)",
+        issue: "Anti-spoofing SHA gate rejected this transition (ZAL-89)",
       });
     }
   }
@@ -5866,11 +5871,13 @@ export function issueRoutes(
     if (req.actor.type !== "agent") {
       return;
     }
-    // Author worktree = the most recent commit proof's repoPath. If no
-    // commit proof exists yet, the peer cannot anchor its independence and
-    // the service rejects with ProofRequired.
+    // Author worktree + author agent = the most recent commit proof's
+    // repoPath and submittedByAgentId. If no commit proof exists yet, the
+    // peer cannot anchor its independence and the service rejects with
+    // ProofRequired. Both anchors feed the ZAL-89 PeerNotIndependent gate.
     const commitProofs = await completionProofsSvc.listForIssue(issue.id, { kind: "commit" });
     const authorWorktree = commitProofs[0]?.payload?.repoPath ?? null;
+    const authorAgentId = commitProofs[0]?.submittedByAgentId ?? null;
     try {
       const proof = await completionProofsSvc.submitPeerVerification(
         { id: issue.id, companyId: issue.companyId },
@@ -5881,11 +5888,12 @@ export function issueRoutes(
           runId: req.actor.runId ?? null,
         },
         authorWorktree,
+        authorAgentId,
       );
       res.status(201).json(proof);
     } catch (err) {
       const code = (err as Error & { code?: string }).code ?? "submit_failed";
-      if (code === "PeerNotIndependent") {
+      if (code === "PeerNotIndependent" || code === "ProofRequired") {
         res.status(409).json({ error: (err as Error).message, code });
         return;
       }

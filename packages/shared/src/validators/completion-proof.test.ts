@@ -72,7 +72,10 @@ describe("completion-proof validator", () => {
         sha: "cf2c34437e03b9c2bd2547560a83c7b8cf36a5dc",
         repoPath: "/Users/elvisvaldesinerarte/Desktop/_PROYECTOS/Paperclip",
         peerWorktree: "/Users/elvisvaldesinerarte/.paperclip/instances/default/workspaces/web-developer",
-        commands: ["git cat-file -t cf2c34437", "git log -1 --format=%H cf2c34437"],
+        commands: [
+          "git -C /Users/elvisvaldesinerarte/.paperclip/instances/default/workspaces/web-developer cat-file -t cf2c34437e03b9c2bd2547560a83c7b8cf36a5dc",
+          "git -C /Users/elvisvaldesinerarte/.paperclip/instances/default/workspaces/web-developer log -1 --format=%H cf2c34437e03b9c2bd2547560a83c7b8cf36a5dc",
+        ],
         commandOutput: "commit\ncf2c34437e03b9c2bd2547560a83c7b8cf36a5dc\n",
       });
       expect(result.success).toBe(true);
@@ -106,6 +109,68 @@ describe("completion-proof validator", () => {
         peerWorktree: "/tmp/peer",
         commands: ["git cat-file -t cf2c34437"],
         commandOutput: "commit\n",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    // ZAL-89: the payload must include the literal executable block
+    // `git -C <peerWorktree> cat-file -t <sha>` and
+    // `git -C <peerWorktree> log -1 --format=%H <sha>`. Anything weaker is
+    // a validator rejection; the runtime never sees the row.
+    it("rejects when commands omit the cat-file -t block", () => {
+      const result = createIssueCompletionPeerVerificationProofSchema.safeParse({
+        sha: "cf2c34437",
+        repoPath: "/tmp/repo",
+        peerWorktree: "/tmp/peer",
+        commands: ["git -C /tmp/peer log -1 --format=%H cf2c34437"],
+        commandOutput: "cf2c34437\n",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => /cat-file/.test(i.message))).toBe(true);
+      }
+    });
+
+    it("rejects when commands omit the log -1 --format=%H block", () => {
+      const result = createIssueCompletionPeerVerificationProofSchema.safeParse({
+        sha: "cf2c34437",
+        repoPath: "/tmp/repo",
+        peerWorktree: "/tmp/peer",
+        commands: ["git -C /tmp/peer cat-file -t cf2c34437"],
+        commandOutput: "commit\n",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => /log -1/.test(i.message))).toBe(true);
+      }
+    });
+
+    it("accepts when commands include both blocks with the literal form", () => {
+      const result = createIssueCompletionPeerVerificationProofSchema.safeParse({
+        sha: "cf2c34437",
+        repoPath: "/tmp/repo",
+        peerWorktree: "/tmp/peer",
+        commands: [
+          "git -C /tmp/peer cat-file -t cf2c34437",
+          "git -C /tmp/peer log -1 --format=%H cf2c34437",
+        ],
+        commandOutput: "commit\ncf2c34437\n",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects when commands include a non-`git -C` variant of the blocks", () => {
+      // `cd /tmp/peer && git cat-file -t` is not the literal block the
+      // runtime re-runs. The validator must reject it.
+      const result = createIssueCompletionPeerVerificationProofSchema.safeParse({
+        sha: "cf2c34437",
+        repoPath: "/tmp/repo",
+        peerWorktree: "/tmp/peer",
+        commands: [
+          "cd /tmp/peer && git cat-file -t cf2c34437",
+          "cd /tmp/peer && git log -1 --format=%H cf2c34437",
+        ],
+        commandOutput: "commit\ncf2c34437\n",
       });
       expect(result.success).toBe(false);
     });
