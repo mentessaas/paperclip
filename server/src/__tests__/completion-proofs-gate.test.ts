@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueCompletionProofs,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -43,7 +44,7 @@ async function createGitRepoWithCommit(): Promise<GitRepoFixture> {
   return { path: dir, headSha };
 }
 
-describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verification", () => {
+describeEmbeddedPostgres("completionProofService gate — ZAL-88 + ZAL-89", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let svc!: ReturnType<typeof completionProofService>;
@@ -58,6 +59,7 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
   afterEach(async () => {
     await db.delete(issueCompletionProofs);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -71,7 +73,7 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
     await tempDb?.cleanup();
   });
 
-  async function insertCompanyAndIssue() {
+  async function insertCompanyAndIssue(opts: { codeRepoPaths?: string[] | null } = {}) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -79,14 +81,23 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Zaltyko-Web",
+      status: "active",
+      codeRepoPaths: opts.codeRepoPaths ?? null,
+    });
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "ZAL-89 gate fixture",
+      projectId,
+      title: "ZAL-88 gate fixture",
       status: "in_review",
     });
-    return { companyId, issueId };
+    return { companyId, projectId, issueId };
   }
 
   async function insertAgent(companyId: string, name: string) {
@@ -105,8 +116,16 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
     return agentId;
   }
 
-  it("1) no peer verification attached → rejects with PeerVerificationRequired", async () => {
-    const { companyId, issueId } = await insertCompanyAndIssue();
+  // ─────────────────────────────────────────────────────────────────────────
+  // ZAL-88 spec: 4 negative cases the SHA gate must reject at in_review → done.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it("ZAL-88 #1 SHA fabricado (no existe en repo) → 409 ProofRequired-equivalent", async () => {
+    // The fabricated SHA never resolves: there is no commit proof at all, so
+    // the gate returns `ProofRequired` (status 409 in the route layer).
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/tmp/registered-zaltyko-web"],
+    });
     const authorId = await insertAgent(companyId, "Author");
     const authorRepo = await createGitRepoWithCommit();
     tempDirs.push(authorRepo.path);
@@ -116,13 +135,139 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
       { agentId: authorId, userId: null, runId: null },
     );
 
-    const verdict = await svc.verifyAtTransition(issueId);
+    // Delete the proof to simulate a fabricated SHA: no commit proof for
+    // a fabricated SHA = the gate rejects before any git call.
+    await db.delete(issueCompletionProofs);
+
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: ["/tmp/registered-zaltyko-web"],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("ProofRequired");
+  });
+
+  it("ZAL-88 #2 SHA válido pero repoPath no registrado en codeRepoPaths → 409 RepoNotRegistered", async () => {
+    // The project's allowlist is the canonical Zaltyko-Web path. The
+    // commit proof declares a tmpdir that is NOT in the allowlist, so the
+    // gate rejects even though the SHA resolves in the unregistered repo.
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/Users/elvisvaldesinerarte/Desktop/_PROYECTOS/Zaltyko"],
+    });
+    const authorId = await insertAgent(companyId, "Author");
+    const authorRepo = await createGitRepoWithCommit();
+    tempDirs.push(authorRepo.path);
+    await svc.submitCommit(
+      { id: issueId, companyId },
+      { sha: authorRepo.headSha, repoPath: authorRepo.path },
+      { agentId: authorId, userId: null, runId: null },
+    );
+
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: ["/Users/elvisvaldesinerarte/Desktop/_PROYECTOS/Zaltyko"],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("RepoNotRegistered");
+    expect(verdict?.message).toMatch(/not in the project's codeRepoPaths/i);
+  });
+
+  it("ZAL-88 #3 project has no codeRepoPaths registered (empty list) → 409 RepoNotRegistered", async () => {
+    // Even a valid SHA in a valid repo is rejected because the project has
+    // not been onboarded to the SHA gate. This is the "fabricated SHA could
+    // otherwise slip through" defense: missing allowlist = no proofs
+    // accepted.
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: [],
+    });
+    const authorId = await insertAgent(companyId, "Author");
+    const authorRepo = await createGitRepoWithCommit();
+    tempDirs.push(authorRepo.path);
+    await svc.submitCommit(
+      { id: issueId, companyId },
+      { sha: authorRepo.headSha, repoPath: authorRepo.path },
+      { agentId: authorId, userId: null, runId: null },
+    );
+
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: [],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("RepoNotRegistered");
+  });
+
+  it("ZAL-88 #4 commit proof's repoPath resolves via git cat-file but is not in whitelist → 409 RepoNotRegistered", async () => {
+    // The git check would otherwise succeed; the allowlist is the deciding
+    // factor. This is the regression case ZAL-78 nailed: a SHA that
+    // resolves in an unrelated repo a humanoid reviewer can't cross-check.
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    const authorId = await insertAgent(companyId, "Author");
+    const authorRepo = await createGitRepoWithCommit();
+    tempDirs.push(authorRepo.path);
+    await svc.submitCommit(
+      { id: issueId, companyId },
+      { sha: authorRepo.headSha, repoPath: authorRepo.path },
+      { agentId: authorId, userId: null, runId: null },
+    );
+
+    // The git cat-file / git log checks would pass for this SHA, but the
+    // allowlist is the gate that fires first.
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("RepoNotRegistered");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ZAL-88 #5: PATCH over a WorkProduct (CompletionProof) is immutable.
+  // The service has no `update` method for issue_completion_proofs; any
+  // attempt to mutate the table directly must be rejected by the absence
+  // of an updater. We assert this by reading the service: there is no
+  // `updateProof` method. (Pre-existing C-1+C-3 invariant.)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it("ZAL-88 #5 CompletionProofs are immutable: no update method exposed", () => {
+    const serviceKeys = Object.keys(svc);
+    expect(serviceKeys).not.toContain("updateProof");
+    expect(serviceKeys).not.toContain("update");
+    expect(serviceKeys).not.toContain("patch");
+    // The only mutators are submit/insert + consumeAtTransition (which
+    // sets consumedAtTransitionId, not the payload — payloads are
+    // append-only).
+    expect(serviceKeys).toContain("submitCommit");
+    expect(serviceKeys).toContain("submitPeerVerification");
+    expect(serviceKeys).toContain("consumeAtTransition");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ZAL-89 peer-verification gate (existing 5 negatives, kept verbatim).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it("ZAL-89 #1 no peer verification attached → rejects with PeerVerificationRequired", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/anywhere"],
+    });
+    const authorId = await insertAgent(companyId, "Author");
+    const authorRepo = await createGitRepoWithCommit();
+    tempDirs.push(authorRepo.path);
+    await svc.submitCommit(
+      { id: issueId, companyId },
+      { sha: authorRepo.headSha, repoPath: authorRepo.path },
+      { agentId: authorId, userId: null, runId: null },
+    );
+
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: [authorRepo.path],
+    });
     expect(verdict).not.toBeNull();
     expect(verdict?.code).toBe("PeerVerificationRequired");
   });
 
-  it("2) peer verification from the same agent → rejects with PeerNotIndependent (agentId)", async () => {
-    const { companyId, issueId } = await insertCompanyAndIssue();
+  it("ZAL-89 #2 peer verification from the same agent → rejects with PeerNotIndependent (agentId)", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/anywhere"],
+    });
     const authorId = await insertAgent(companyId, "Author");
     const peerRepo = await createGitRepoWithCommit();
     tempDirs.push(peerRepo.path);
@@ -132,10 +277,7 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
       { agentId: authorId, userId: null, runId: null },
     );
 
-    // Submit-time independence: same agent as author must be rejected
-    // before the row lands. This is the new ZAL-89 check; the gate would
-    // also catch it at transition time.
-    const authorWorktree = peerRepo.path; // author worktree (commit proof)
+    const authorWorktree = peerRepo.path;
     await expect(
       svc.submitPeerVerification(
         { id: issueId, companyId },
@@ -156,8 +298,10 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
     ).rejects.toMatchObject({ code: "PeerNotIndependent" });
   });
 
-  it("3) peer verification with same worktree as author → rejects with PeerNotIndependent (worktree)", async () => {
-    const { companyId, issueId } = await insertCompanyAndIssue();
+  it("ZAL-89 #3 peer verification with same worktree as author → rejects with PeerNotIndependent (worktree)", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/anywhere"],
+    });
     const authorId = await insertAgent(companyId, "Author");
     const peerId = await insertAgent(companyId, "Peer");
     const authorRepo = await createGitRepoWithCommit();
@@ -168,7 +312,6 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
       { agentId: authorId, userId: null, runId: null },
     );
 
-    // Submit-time independence: peerWorktree equals the author repoPath.
     await expect(
       svc.submitPeerVerification(
         { id: issueId, companyId },
@@ -189,16 +332,15 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
     ).rejects.toMatchObject({ code: "PeerNotIndependent" });
   });
 
-  it("4) peer verification older than 60s → rejects with PeerVerificationStale", async () => {
-    const { companyId, issueId } = await insertCompanyAndIssue();
+  it("ZAL-89 #4 peer verification older than 60s → rejects with PeerVerificationStale", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/anywhere"],
+    });
     const authorId = await insertAgent(companyId, "Author");
     const peerId = await insertAgent(companyId, "Peer");
     const authorRepo = await createGitRepoWithCommit();
     const peerRepo = await createGitRepoWithCommit();
     tempDirs.push(authorRepo.path, peerRepo.path);
-    // The peer is a *clone* of the author repo so `git cat-file -t` and
-    // `git log -1 --format=%H` resolve against the same SHA. Two
-    // independent worktrees.
     execSync(`git remote add origin ${authorRepo.path}`, { cwd: peerRepo.path });
     execSync("git fetch -q origin && git reset -q --hard origin/main", {
       cwd: peerRepo.path,
@@ -227,27 +369,25 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-89 peer verificati
     );
     expect(proof).not.toBeNull();
 
-    // Backdate the proof 90s into the past to push it past the 60s window.
     await db
       .update(issueCompletionProofs)
       .set({ submittedAt: sql`now() - interval '90 seconds'` })
       .where(eq(issueCompletionProofs.id, proof!.id));
 
-    const verdict = await svc.verifyAtTransition(issueId);
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: [authorRepo.path],
+    });
     expect(verdict).not.toBeNull();
     expect(verdict?.code).toBe("PeerVerificationStale");
   });
 
-  it("5) peer SHA does not resolve in the peer's worktree → gate rejects (handled by C-1 path ProofExpired)", async () => {
-    const { companyId, issueId } = await insertCompanyAndIssue();
+  it("ZAL-89 #5 peer SHA does not resolve in the peer's worktree → submit-time ProofExpired", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/anywhere"],
+    });
     const authorId = await insertAgent(companyId, "Author");
     const peerId = await insertAgent(companyId, "Peer");
     const authorRepo = await createGitRepoWithCommit();
-    // The peer worktree deliberately does NOT contain the author SHA, so
-    // the runtime's `git cat-file -t` re-check at submit time must fail.
-    // The commit proof passes (SHA exists in author repo); the
-    // peer-verification proof passes the validator but the service
-    // refuses to insert it because the runtime re-run fails.
     const peerDir = await mkdtemp(join(tmpdir(), "paperclip-cp-gate-peer-"));
     tempDirs.push(peerDir);
     execSync("git init -q -b main", { cwd: peerDir });

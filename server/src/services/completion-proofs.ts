@@ -264,6 +264,14 @@ export function completionProofService(db: Db) {
       issueId: string,
       options: {
         recoveryPauseFlag?: boolean;
+        /**
+         * Optional project-scoped repo-path allowlist. When provided, the
+         * commit proof's `repoPath` MUST be in the list, otherwise the
+         * gate returns `409 RepoNotRegistered`. ZAL-88: the route resolves
+         * this from `projects.codeRepoPaths`; the service does not look it
+         * up itself to keep the gate composable.
+         */
+        projectRepoPaths?: string[] | null;
       } = {},
     ): Promise<null | {
       code: IssueCompletionProofErrorCode;
@@ -289,6 +297,24 @@ export function completionProofService(db: Db) {
       }
       const commit = commits[0]!;
       const commitPayload = commit.payload as IssueCompletionCommitPayload;
+      // ZAL-88: the project-scoped allowlist. A `null` list means the
+      // project has not been onboarded to the SHA gate (no canonical
+      // repo paths registered), so commit proofs cannot be verified.
+      const allowlist = options.projectRepoPaths ?? null;
+      if (!allowlist || allowlist.length === 0) {
+        return {
+          code: "RepoNotRegistered",
+          message: "project has no canonical repo paths registered; register them in projects.codeRepoPaths",
+          proofId: commit.id,
+        };
+      }
+      if (!allowlist.includes(commitPayload.repoPath)) {
+        return {
+          code: "RepoNotRegistered",
+          message: `repoPath '${commitPayload.repoPath}' is not in the project's codeRepoPaths allowlist`,
+          proofId: commit.id,
+        };
+      }
       try {
         await gitCatFile(commitPayload.repoPath, commitPayload.sha);
         await gitLogSha(commitPayload.repoPath, commitPayload.sha);

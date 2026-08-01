@@ -21,6 +21,15 @@ export const projects = pgTable(
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     executionWorkspacePolicy: jsonb("execution_workspace_policy").$type<Record<string, unknown>>(),
+    /**
+     * Allowlist of canonical repo paths (absolute) that completion-proof
+     * payloads may claim as the repoPath of a commit. Used by the ZAL-88
+     * SHA gate: a commit proof whose `repoPath` is not in this list is
+     * rejected with `409 RepoNotRegistered`. Empty/null list = no commit
+     * proofs accepted. Zaltyko-web and Zaltyko-mobile projects register
+     * both their canonical repo paths here.
+     */
+    codeRepoPaths: jsonb("code_repo_paths").$type<string[] | null>(),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

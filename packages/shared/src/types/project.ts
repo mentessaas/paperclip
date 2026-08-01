@@ -94,6 +94,13 @@ export interface Project {
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
+  /**
+   * Allowlist of canonical repo paths (absolute) accepted by the ZAL-88
+   * SHA gate. A commit proof whose `repoPath` is not in this list is
+   * rejected with `409 RepoNotRegistered`. Null = no commit proofs
+   * accepted.
+   */
+  codeRepoPaths: string[] | null;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;

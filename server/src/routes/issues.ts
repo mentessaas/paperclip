@@ -3299,7 +3299,7 @@ export function issueRoutes(
    * `RecoveryPausedUntilGitGate` until C-4 removes the placeholder.
    */
   async function assertIssueCompletionProofGate(input: {
-    existing: { id: string; companyId: string; status: string };
+    existing: { id: string; companyId: string; status: string; projectId: string | null };
     updateFields: Record<string, unknown>;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
@@ -3311,14 +3311,26 @@ export function issueRoutes(
     // wired to settings yet; the production cutoff happens in ZAL-90.
     const recoveryPauseFlag = process.env.PAPERCLIP_RECOVERY_PAUSE_CODE_GATES === "true";
 
+    // ZAL-88: resolve the project's repo-path allowlist from the project
+    // row. A project without a registered allowlist rejects every commit
+    // proof with `RepoNotRegistered`; zaltyko-web and zaltyko-mobile are
+    // expected to be onboarded before their issues can transition to done.
+    let projectRepoPaths: string[] | null = null;
+    const projectId = input.existing.projectId;
+    if (projectId) {
+      const project = await projectsSvc.getById(projectId);
+      projectRepoPaths = project?.codeRepoPaths ?? null;
+    }
+
     const verdict = await completionProofsSvc.verifyAtTransition(input.existing.id, {
       recoveryPauseFlag,
+      projectRepoPaths,
     });
     if (verdict) {
       throw conflict(verdict.message, {
         code: verdict.code,
         proofId: verdict.proofId,
-        issue: "Anti-spoofing SHA gate rejected this transition (ZAL-89)",
+        issue: "Anti-spoofing SHA gate rejected this transition (ZAL-88)",
       });
     }
   }
