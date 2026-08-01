@@ -5855,8 +5855,8 @@ export function issueRoutes(
       { id: issue.id, companyId: issue.companyId },
       req.body,
       {
-        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-        userId: req.actor.type === "user" ? req.actor.actorId : null,
+        agentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+        userId: req.actor.userId ?? null,
         runId: req.actor.runId ?? null,
       },
     );
@@ -5883,7 +5883,7 @@ export function issueRoutes(
         { id: issue.id, companyId: issue.companyId },
         req.body,
         {
-          agentId: req.actor.agentId,
+          agentId: req.actor.agentId ?? null,
           userId: null,
           runId: req.actor.runId ?? null,
         },
