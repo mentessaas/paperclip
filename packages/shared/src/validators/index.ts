@@ -500,8 +500,10 @@ export {
 export {
   createIssueCompletionCommitProofSchema,
   createIssueCompletionPeerVerificationProofSchema,
+  createIssueCompletionOperationVerificationProofSchema,
   type CreateIssueCompletionCommitProof,
   type CreateIssueCompletionPeerVerificationProof,
+  type CreateIssueCompletionOperationVerificationProof,
 } from "./completion-proof.js";
 
 export {

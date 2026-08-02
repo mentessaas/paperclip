@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -38,6 +38,7 @@ import {
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
   createIssueCompletionCommitProofSchema,
+  createIssueCompletionOperationVerificationProofSchema,
   createIssueCompletionPeerVerificationProofSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -76,6 +77,7 @@ import {
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
+  type IssueCompletionCommitPayload,
   type IssueBlockerDiagnosticFlag,
   type IssueBlockerDiagnosticIssueSummary,
   type IssueBlockerDiagnosticNode,
@@ -3345,11 +3347,25 @@ export function issueRoutes(
       billingCode?: string | null;
     };
     updateFields: Record<string, unknown>;
+    actorAgentId: string | null;
+    transitionId: string;
+    proofService?: ReturnType<typeof completionProofService>;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
     if (input.existing.status === "done" || nextStatus !== "done") return;
+
+    const proofService = input.proofService ?? completionProofsSvc;
+    if (
+      await proofService.tryConsumeOperationVerificationAtTransition(
+        input.existing.id,
+        input.actorAgentId,
+        input.transitionId,
+      )
+    ) {
+      return;
+    }
 
     // ZAL-90 (C-4): runtime flag from the in-process store. Default ON;
     // env var `PAPERCLIP_RUNTIME_FLAG_RECOVERY_PAUSE_CODE_GATES` overrides
@@ -3381,7 +3397,7 @@ export function issueRoutes(
       isCodeIssueResult = resolveCodeIssueFromLabels(input.existing.labelIds, slugById);
     }
 
-    const verdict = await completionProofsSvc.verifyAtTransition(input.existing.id, {
+    const verdict = await proofService.verifyAtTransition(input.existing.id, {
       recoveryPauseFlag,
       isCodeIssue: isCodeIssueResult,
       projectRepoPaths,
@@ -5913,7 +5929,9 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const kind = typeof req.query.kind === "string" ? (req.query.kind as "commit" | "peer_verification") : undefined;
+    const kind = typeof req.query.kind === "string"
+      ? (req.query.kind as "commit" | "peer_verification" | "operation_verification")
+      : undefined;
     const proofs = await completionProofsSvc.listForIssue(issue.id, { kind });
     res.json(proofs);
   });
@@ -5923,17 +5941,93 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    const proof = await completionProofsSvc.submitCommit(
-      { id: issue.id, companyId: issue.companyId },
-      req.body,
-      {
-        agentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
-        userId: req.actor.userId ?? null,
-        runId: req.actor.runId ?? null,
-      },
-    );
-    res.status(201).json(proof);
+    try {
+      const proof = await db.transaction(async (tx) => {
+        await tx.execute(sql`select ${issueRows.id} from ${issueRows} where ${issueRows.id} = ${issue.id} for update`);
+        const lockedIssue = await tx
+          .select({ id: issueRows.id, companyId: issueRows.companyId, status: issueRows.status })
+          .from(issueRows)
+          .where(eq(issueRows.id, issue.id))
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue) return null;
+        return completionProofService(tx as unknown as Db).submitCommit(
+          lockedIssue,
+          req.body,
+          {
+            agentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+            userId: req.actor.userId ?? null,
+            runId: req.actor.runId ?? null,
+          },
+        );
+      });
+      if (!proof) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      res.status(201).json(proof);
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code;
+      if (code === "CompletionProofConflict") {
+        res.status(409).json({ error: (err as Error).message, code });
+        return;
+      }
+      throw err;
+    }
   });
+
+  router.post(
+    "/issues/:id/completion-proofs/operation-verifications",
+    validate(createIssueCompletionOperationVerificationProofSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
+      if (req.actor.type !== "agent" || !req.actor.agentId) {
+        res.status(403).json({
+          error: "OperationVerificationNotAllowed: an agent verifier is required",
+          code: "OperationVerificationNotAllowed",
+        });
+        return;
+      }
+      try {
+        const proof = await db.transaction(async (tx) => {
+          await tx.execute(sql`select ${issueRows.id} from ${issueRows} where ${issueRows.id} = ${issue.id} for update`);
+          const lockedIssue = await tx
+            .select({
+              id: issueRows.id,
+              companyId: issueRows.companyId,
+              parentId: issueRows.parentId,
+              status: issueRows.status,
+              workMode: issueRows.workMode,
+              createdByAgentId: issueRows.createdByAgentId,
+              assigneeAgentId: issueRows.assigneeAgentId,
+            })
+            .from(issueRows)
+            .where(eq(issueRows.id, issue.id))
+            .then((rows) => rows[0] ?? null);
+          if (!lockedIssue) return null;
+          return completionProofService(tx as unknown as Db).submitOperationVerification(
+            lockedIssue,
+            req.body,
+            { agentId: req.actor.agentId ?? null, userId: null, runId: req.actor.runId ?? null },
+          );
+        });
+        if (!proof) {
+          res.status(404).json({ error: "Issue not found" });
+          return;
+        }
+        res.status(201).json(proof);
+      } catch (err) {
+        const code = (err as Error & { code?: string }).code;
+        if (code === "CompletionProofConflict" || code === "OperationVerificationNotAllowed") {
+          res.status(409).json({ error: (err as Error).message, code });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
 
   router.post("/issues/:id/completion-proofs/peer-verifications", validate(createIssueCompletionPeerVerificationProofSchema), async (req, res) => {
     const id = req.params.id as string;
@@ -5948,7 +6042,8 @@ export function issueRoutes(
     // peer cannot anchor its independence and the service rejects with
     // ProofRequired. Both anchors feed the ZAL-89 PeerNotIndependent gate.
     const commitProofs = await completionProofsSvc.listForIssue(issue.id, { kind: "commit" });
-    const authorWorktree = commitProofs[0]?.payload?.repoPath ?? null;
+    const commitPayload = commitProofs[0]?.payload as IssueCompletionCommitPayload | undefined;
+    const authorWorktree = commitPayload?.repoPath ?? null;
     const authorAgentId = commitProofs[0]?.submittedByAgentId ?? null;
     try {
       const proof = await completionProofsSvc.submitPeerVerification(
@@ -8235,11 +8330,6 @@ export function issueRoutes(
       actorType: req.actor.type,
     });
 
-    await assertIssueCompletionProofGate({
-      existing,
-      updateFields,
-    });
-
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);
     const nextAssigneeUserId =
@@ -8301,7 +8391,60 @@ export function issueRoutes(
     } = { value: null };
     let issue: Awaited<ReturnType<typeof svc.update>>;
     try {
-      if (transition.decision && decisionId) {
+      if (updateFields.status === "done") {
+        issue = await db.transaction(async (tx) => {
+          await tx.execute(sql`select ${issueRows.id} from ${issueRows} where ${issueRows.id} = ${id} for update`);
+          const lockedIssue = await tx
+            .select({
+              id: issueRows.id,
+              companyId: issueRows.companyId,
+              status: issueRows.status,
+              projectId: issueRows.projectId,
+              billingCode: issueRows.billingCode,
+            })
+            .from(issueRows)
+            .where(eq(issueRows.id, id))
+            .then((rows) => rows[0] ?? null);
+          if (!lockedIssue) return null;
+          await assertIssueCompletionProofGate({
+            existing: { ...lockedIssue, labelIds: existing.labelIds },
+            updateFields,
+            actorAgentId: actor.agentId ?? null,
+            transitionId: randomUUID(),
+            proofService: completionProofService(tx as unknown as Db),
+          });
+
+          const updated = await svc.update(
+            id,
+            {
+              ...updateFields,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            },
+            tx,
+          );
+          if (!updated) return null;
+          if (transition.decision && decisionId) {
+            const decision = transition.decision;
+            await tx.insert(issueExecutionDecisions).values({
+              id: decisionId,
+              companyId: updated.companyId,
+              issueId: updated.id,
+              stageId: decision.stageId,
+              stageType: decision.stageType,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              outcome: decision.outcome,
+              body: decision.body,
+              createdByRunId: actor.runId ?? null,
+            });
+          }
+          if (shouldRelayStop) {
+            stopRelayResult.value = await svc.addStopRelayCommentIfNeeded(updated, tx);
+          }
+          return updated;
+        });
+      } else if (transition.decision && decisionId) {
         const decision = transition.decision;
         issue = await db.transaction(async (tx) => {
           const updated = await svc.update(
@@ -10414,6 +10557,27 @@ export function issueRoutes(
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
       try {
         txResult = await db.transaction(async (tx) => {
+          await tx.execute(sql`select ${issueRows.id} from ${issueRows} where ${issueRows.id} = ${id} for update`);
+          const lockedIssue = await tx
+            .select({
+              id: issueRows.id,
+              companyId: issueRows.companyId,
+              status: issueRows.status,
+              projectId: issueRows.projectId,
+              billingCode: issueRows.billingCode,
+            })
+            .from(issueRows)
+            .where(eq(issueRows.id, id))
+            .then((rows) => rows[0] ?? null);
+          if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+          await assertIssueCompletionProofGate({
+            existing: { ...lockedIssue, labelIds: currentIssue.labelIds },
+            updateFields: updatePatch,
+            actorAgentId: actor.agentId ?? null,
+            transitionId: randomUUID(),
+            proofService: completionProofService(tx as unknown as Db),
+          });
+
           const insertedComment = await svc.addComment(
             id,
             req.body.body,

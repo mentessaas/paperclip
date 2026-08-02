@@ -523,6 +523,7 @@ export type {
   IssueCompletionProofKind,
   IssueCompletionCommitPayload,
   IssueCompletionPeerVerificationPayload,
+  IssueCompletionOperationVerificationPayload,
   IssueCompletionProofErrorCode,
 } from "./completion-proof.js";
 export type {

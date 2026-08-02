@@ -9,7 +9,7 @@
  */
 
 /** Kinds accepted at insertion. Anything else is a 422 at the route layer. */
-export type IssueCompletionProofKind = "commit" | "peer_verification";
+export type IssueCompletionProofKind = "commit" | "peer_verification" | "operation_verification";
 
 /**
  * The SHA + repoPath the issuer claims produced the change. Validated at
@@ -62,12 +62,26 @@ export interface IssueCompletionPeerVerificationPayload {
   note?: string;
 }
 
+/**
+ * Verification of durable, no-code operational evidence. The referenced
+ * comment must belong to the same issue, remain undeleted, and have been
+ * authored by the issue's current assignee. The runtime revalidates all of
+ * those facts when the proof is inserted and again when it is consumed.
+ */
+export interface IssueCompletionOperationVerificationPayload {
+  commentId: string;
+  summary: string;
+}
+
 export interface IssueCompletionProof {
   id: string;
   companyId: string;
   issueId: string;
   kind: IssueCompletionProofKind;
-  payload: IssueCompletionCommitPayload | IssueCompletionPeerVerificationPayload;
+  payload:
+    | IssueCompletionCommitPayload
+    | IssueCompletionPeerVerificationPayload
+    | IssueCompletionOperationVerificationPayload;
   submittedByAgentId: string | null;
   submittedByUserId: string | null;
   submittedByRunId: string | null;
@@ -91,5 +105,7 @@ export type IssueCompletionProofErrorCode =
   | "PeerNotIndependent"
   | "PeerVerificationStale"
   | "PeerVerificationRequired"
+  | "CompletionProofConflict"
+  | "OperationVerificationNotAllowed"
   | "CompletionProofTamper"
   | "RecoveryPausedUntilGitGate";

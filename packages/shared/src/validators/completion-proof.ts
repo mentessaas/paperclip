@@ -48,3 +48,12 @@ export const createIssueCompletionPeerVerificationProofSchema = z.object({
 });
 
 export type CreateIssueCompletionPeerVerificationProof = z.infer<typeof createIssueCompletionPeerVerificationProofSchema>;
+
+export const createIssueCompletionOperationVerificationProofSchema = z.object({
+  commentId: z.string().uuid("commentId must be a UUID"),
+  summary: z.string().trim().min(1, "summary is required").max(500),
+});
+
+export type CreateIssueCompletionOperationVerificationProof = z.infer<
+  typeof createIssueCompletionOperationVerificationProofSchema
+>;

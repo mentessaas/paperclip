@@ -451,6 +451,7 @@ Operational policy:
 The current implementation includes additional V1-control-plane tables beyond the original February snapshot:
 
 - Issue structure and review: `issue_relations` for blockers, `labels`/`issue_labels`, `issue_thread_interactions`, `issue_approvals`, `issue_execution_decisions`, `issue_work_products`, `issue_inbox_archives`, `issue_read_states`, and issue reference mention indexes.
+- Completion evidence: immutable `issue_completion_proofs` supports commit/peer evidence and the mutually exclusive `operation_verification` proof for standard no-code operations. Operation proofs bind a bounded summary to an undeleted assignee-authored comment and may be issued only by the distinct agent creator while that creator still owns the direct parent; insertions and terminal closure serialize on the issue row.
 - Execution and workspace control: `execution_workspaces`, `project_workspaces`, `workspace_runtime_services`, `workspace_operations`, `environments`, `environment_leases`, `agent_task_sessions`, `agent_runtime_state`, `agent_wakeup_requests`, heartbeat events, and watchdog decision tables.
 - Plugins and routines: `plugins`, plugin config/state/entities/jobs/logs/webhooks, plugin database namespaces/migrations, plugin company settings, `routines`, `routine_revisions`, `routine_triggers`, and `routine_runs`.
 - Access and operations: company memberships, instance roles, principal permission grants, invites, join requests, board API keys, CLI auth challenges, budget policies/incidents, feedback exports/votes, company skills, sidebar preferences, and company logos.
@@ -874,6 +875,10 @@ All endpoints are under `/api` and return JSON.
 - `POST /issues/:issueId/release`
 - `POST /issues/:issueId/admin/force-release` (board-only lock recovery)
 - `POST /issues/:issueId/comments`
+- `GET /issues/:issueId/completion-proofs`
+- `POST /issues/:issueId/completion-proofs/commits`
+- `POST /issues/:issueId/completion-proofs/peer-verifications`
+- `POST /issues/:issueId/completion-proofs/operation-verifications`
 - `GET /issues/:issueId/comments`
 - `POST /companies/:companyId/issues/:issueId/attachments` (multipart upload)
 - `GET /issues/:issueId/attachments`

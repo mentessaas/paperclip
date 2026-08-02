@@ -1,10 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
   createIssueCompletionCommitProofSchema,
+  createIssueCompletionOperationVerificationProofSchema,
   createIssueCompletionPeerVerificationProofSchema,
 } from "./completion-proof.js";
 
 describe("completion-proof validator", () => {
+  describe("createIssueCompletionOperationVerificationProofSchema", () => {
+    it("accepts a durable comment reference and bounded summary", () => {
+      expect(createIssueCompletionOperationVerificationProofSchema.safeParse({
+        commentId: "73f97437-6326-4b6d-a8c7-e9636c02d175",
+        summary: "Sandbox operation completed and independently checked.",
+      }).success).toBe(true);
+    });
+
+    it("rejects malformed comment ids and unbounded summaries", () => {
+      expect(createIssueCompletionOperationVerificationProofSchema.safeParse({
+        commentId: "not-a-comment",
+        summary: "valid",
+      }).success).toBe(false);
+      expect(createIssueCompletionOperationVerificationProofSchema.safeParse({
+        commentId: "73f97437-6326-4b6d-a8c7-e9636c02d175",
+        summary: "x".repeat(501),
+      }).success).toBe(false);
+    });
+  });
+
   describe("createIssueCompletionCommitProofSchema", () => {
     it("accepts a minimal valid commit payload", () => {
       const result = createIssueCompletionCommitProofSchema.safeParse({

@@ -22,7 +22,7 @@ import type {
  * that must exist before the runtime will accept an `in_review → done`
  * transition on a code issue (C-1 + C-3 of ZAL-86 / ZAL-88).
  *
- * Two kinds are accepted:
+ * Three kinds are accepted:
  *
  *   - `commit`: the agent that produced the code submits the SHA + repoPath.
  *     The runtime resolves it via `git -C <repoPath> cat-file -t <sha>` at
@@ -32,6 +32,10 @@ import type {
  *     issuer, distinct worktree) posts the executable commands + their literal
  *     output that independently resolves the same SHA. The runtime enforces a
  *     60-second freshness window between the comment and the transition.
+ *
+ *   - `operation_verification`: the issue creator, while still owning the
+ *     direct parent, verifies durable evidence written by the issue assignee.
+ *     It is mutually exclusive with commit evidence.
  *
  * Rows are immutable by convention. A board user may supersede a proof by
  * setting `supersededAt` (which the runtime treats as soft-deleted); any other

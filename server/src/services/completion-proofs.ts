@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueCompletionProofs } from "@paperclipai/db";
+import { issueComments, issueCompletionProofs, issues } from "@paperclipai/db";
 import type {
   IssueCompletionProof,
   IssueCompletionCommitPayload,
+  IssueCompletionOperationVerificationPayload,
   IssueCompletionPeerVerificationPayload,
   IssueCompletionProofErrorCode,
 } from "@paperclipai/shared";
@@ -13,6 +14,7 @@ type IssueCompletionProofRow = typeof issueCompletionProofs.$inferSelect;
 
 const PEER_FRESHNESS_MS = 60_000;
 const PROOF_VALIDATION_TIMEOUT_MS = 5_000;
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 interface GitResult {
   stdout: string;
@@ -89,8 +91,17 @@ async function gitLogSha(cwd: string, sha: string): Promise<string> {
 }
 
 export function completionProofService(db: Db) {
+  function proofConflict(code: "CompletionProofConflict" | "OperationVerificationNotAllowed", message: string) {
+    const err = new Error(`${code}: ${message}`);
+    (err as Error & { code: string }).code = code;
+    return err;
+  }
+
   return {
-    listForIssue: async (issueId: string, opts: { kind?: "commit" | "peer_verification" } = {}) => {
+    listForIssue: async (
+      issueId: string,
+      opts: { kind?: "commit" | "peer_verification" | "operation_verification" } = {},
+    ) => {
       const where = opts.kind
         ? and(eq(issueCompletionProofs.issueId, issueId), eq(issueCompletionProofs.kind, opts.kind))
         : eq(issueCompletionProofs.issueId, issueId);
@@ -111,7 +122,7 @@ export function completionProofService(db: Db) {
      * commit lands in their worktree.
      */
     submitCommit: async (
-      issue: { id: string; companyId: string },
+      issue: { id: string; companyId: string; status?: string },
       payload: IssueCompletionCommitPayload,
       actor: {
         agentId: string | null;
@@ -125,12 +136,131 @@ export function completionProofService(db: Db) {
       if (!payload.repoPath || typeof payload.repoPath !== "string") {
         throw new Error("repoPath is required");
       }
+      if (issue.status && TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+        throw proofConflict("CompletionProofConflict", "commit proofs cannot be added to terminal issues");
+      }
+      const operationProof = await db
+        .select({ id: issueCompletionProofs.id })
+        .from(issueCompletionProofs)
+        .where(
+          and(
+            eq(issueCompletionProofs.issueId, issue.id),
+            eq(issueCompletionProofs.kind, "operation_verification"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (operationProof) {
+        throw proofConflict(
+          "CompletionProofConflict",
+          "commit proofs cannot coexist with operation_verification",
+        );
+      }
       const row = await db
         .insert(issueCompletionProofs)
         .values({
           companyId: issue.companyId,
           issueId: issue.id,
           kind: "commit",
+          payload,
+          submittedByAgentId: actor.agentId,
+          submittedByUserId: actor.userId,
+          submittedByRunId: actor.runId,
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return row ? toIssueCompletionProof(row) : null;
+    },
+
+    /**
+     * Insert an operation_verification proof. The caller must hold a
+     * FOR UPDATE lock on the issue row for the duration of this call; the
+     * routes use the same lock for commit insertion and terminal closure.
+     */
+    submitOperationVerification: async (
+      issue: {
+        id: string;
+        companyId: string;
+        parentId: string | null;
+        status: string;
+        workMode: string;
+        createdByAgentId: string | null;
+        assigneeAgentId: string | null;
+      },
+      payload: IssueCompletionOperationVerificationPayload,
+      actor: { agentId: string | null; userId: string | null; runId: string | null },
+    ) => {
+      if (!actor.agentId) {
+        throw proofConflict("OperationVerificationNotAllowed", "an agent verifier is required");
+      }
+      if (issue.workMode !== "standard" || TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+        throw proofConflict(
+          "OperationVerificationNotAllowed",
+          "operation verification requires a non-terminal standard issue",
+        );
+      }
+      if (
+        !issue.parentId ||
+        !issue.createdByAgentId ||
+        !issue.assigneeAgentId ||
+        actor.agentId !== issue.createdByAgentId ||
+        actor.agentId === issue.assigneeAgentId
+      ) {
+        throw proofConflict(
+          "OperationVerificationNotAllowed",
+          "verifier must be the distinct agent creator of the issue",
+        );
+      }
+
+      const parent = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issue.parentId), eq(issues.companyId, issue.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!parent || parent.assigneeAgentId !== actor.agentId) {
+        throw proofConflict(
+          "OperationVerificationNotAllowed",
+          "verifier no longer owns the direct parent issue",
+        );
+      }
+
+      const comment = await db
+        .select({ authorAgentId: issueComments.authorAgentId, deletedAt: issueComments.deletedAt })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.id, payload.commentId),
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.companyId, issue.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!comment || comment.deletedAt || comment.authorAgentId !== issue.assigneeAgentId) {
+        throw proofConflict(
+          "OperationVerificationNotAllowed",
+          "comment must be durable evidence authored by the issue assignee on this issue",
+        );
+      }
+
+      const priorProof = await db
+        .select({ id: issueCompletionProofs.id, kind: issueCompletionProofs.kind })
+        .from(issueCompletionProofs)
+        .where(eq(issueCompletionProofs.issueId, issue.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (priorProof) {
+        throw proofConflict(
+          "CompletionProofConflict",
+          `operation_verification cannot follow existing ${priorProof.kind} proof`,
+        );
+      }
+
+      const row = await db
+        .insert(issueCompletionProofs)
+        .values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          kind: "operation_verification",
           payload,
           submittedByAgentId: actor.agentId,
           submittedByUserId: actor.userId,
@@ -276,10 +406,95 @@ export function completionProofService(db: Db) {
           and(
             isNull(issueCompletionProofs.consumedAtTransitionId),
             isNull(issueCompletionProofs.supersededAt),
+            inArray(issueCompletionProofs.id, proofIds),
           ),
         )
         .returning({ id: issueCompletionProofs.id });
       return updated.length;
+    },
+
+    /**
+     * Revalidate and consume an operation proof during terminal transition.
+     * Returns false for every missing or failed invariant so the caller can
+     * execute the ordinary SHA/repo/peer gate unchanged.
+     */
+    tryConsumeOperationVerificationAtTransition: async (
+      issueId: string,
+      actorAgentId: string | null,
+      transitionId: string,
+    ): Promise<boolean> => {
+      if (!actorAgentId) return false;
+      const issue = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          parentId: issues.parentId,
+          status: issues.status,
+          workMode: issues.workMode,
+          createdByAgentId: issues.createdByAgentId,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (
+        !issue ||
+        issue.workMode !== "standard" ||
+        TERMINAL_ISSUE_STATUSES.has(issue.status) ||
+        !issue.parentId ||
+        !issue.createdByAgentId ||
+        !issue.assigneeAgentId ||
+        actorAgentId !== issue.assigneeAgentId
+      ) {
+        return false;
+      }
+
+      const proofs = await db
+        .select()
+        .from(issueCompletionProofs)
+        .where(eq(issueCompletionProofs.issueId, issue.id))
+        .orderBy(desc(issueCompletionProofs.submittedAt));
+      if (proofs.some((proof) => proof.kind === "commit")) return false;
+      const operationProof = proofs.find(
+        (proof) =>
+          proof.kind === "operation_verification" &&
+          proof.supersededAt === null &&
+          proof.consumedAtTransitionId === null,
+      );
+      if (!operationProof || operationProof.submittedByAgentId !== issue.createdByAgentId) return false;
+
+      const parent = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issue.parentId), eq(issues.companyId, issue.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!parent || parent.assigneeAgentId !== issue.createdByAgentId) return false;
+
+      const payload = operationProof.payload as IssueCompletionOperationVerificationPayload;
+      const comment = await db
+        .select({ authorAgentId: issueComments.authorAgentId, deletedAt: issueComments.deletedAt })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.id, payload.commentId),
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.companyId, issue.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!comment || comment.deletedAt || comment.authorAgentId !== issue.assigneeAgentId) return false;
+
+      return (await db
+        .update(issueCompletionProofs)
+        .set({ consumedAtTransitionId: transitionId })
+        .where(
+          and(
+            eq(issueCompletionProofs.id, operationProof.id),
+            isNull(issueCompletionProofs.consumedAtTransitionId),
+            isNull(issueCompletionProofs.supersededAt),
+          ),
+        )
+        .returning({ id: issueCompletionProofs.id })).length === 1;
     },
 
     /**
