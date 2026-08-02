@@ -114,6 +114,7 @@ import {
   issueRecoveryActionService,
   issueThreadInteractionService,
   completionProofService,
+  defaultRuntimeFlagService,
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
@@ -3279,9 +3280,9 @@ export function issueRoutes(
   }
 
   /**
-   * IssueCompletionProof gate (ZAL-86 / ZAL-89). Runs at `in_review -> done`
-   * transitions for code-bearing issues. Rejects the transition with a 409
-   * unless the runtime finds:
+   * IssueCompletionProof gate (ZAL-86 / ZAL-89 / ZAL-90). Runs at
+   * `in_review -> done` transitions for code-bearing issues. Rejects the
+   * transition with a 409 unless the runtime finds:
    *   - a non-superseded `commit` proof attached to the issue
    *   - whose SHA resolves via `git cat-file -t` + `git log -1 --format=%H`
    *     against the author `repoPath`
@@ -3294,12 +3295,55 @@ export function issueRoutes(
    * (PeerVerificationRequired, PeerNotIndependent, PeerVerificationStale, ProofExpired,
    * RecoveryPausedUntilGitGate, ...).
    *
-   * If `recovery.pause.codeGates` is set, every transition that would
-   * trigger an implicit recovery-action auto-close is rejected with
-   * `RecoveryPausedUntilGitGate` until C-4 removes the placeholder.
+   * ZAL-90 (C-4): the `recovery.pause.codeGates` runtime flag acts as a
+   * board-controlled kill switch. When ON, every code-bearing issue
+   * (release-gate / qa / security label, or `code` billing code) is
+   * rejected with `RecoveryPausedUntilGitGate` before the proof + peer
+   * checks run. Non-code issues pass through unchanged so docs /
+   * marketing copy / coordination work is never blocked by the flag.
    */
+  const runtimeFlags = defaultRuntimeFlagService();
+  const CODE_ISSUE_BILLING_PREFIXES = ["ZAL-86", "ZAL-88", "ZAL-89", "ZAL-90", "ZAL-78", "CODE"];
+
+  function isCodeIssue(input: {
+    labelIds?: string[] | null;
+    billingCode?: string | null;
+  }): boolean {
+    if (input.labelIds && input.labelIds.length > 0) {
+      // label-id match is opt-in: the route resolves label slugs ("qa",
+      // "security", "release-gate") to ids before calling. We treat any
+      // non-empty `labelIds` as evidence the call site already classified
+      // the issue — see `codeIssueLabelSlugs` below.
+      return true;
+    }
+    const code = (input.billingCode ?? "").toUpperCase();
+    if (!code) return false;
+    return CODE_ISSUE_BILLING_PREFIXES.some((p) => code.startsWith(p));
+  }
+
+  const codeIssueLabelSlugs = new Set(["release-gate", "qa", "security"]);
+
+  function resolveCodeIssueFromLabels(
+    issueLabelIds: string[] | null | undefined,
+    companyLabelIndex: Map<string, string>,
+  ): boolean {
+    if (!issueLabelIds || issueLabelIds.length === 0) return false;
+    for (const id of issueLabelIds) {
+      const slug = companyLabelIndex.get(id);
+      if (slug && codeIssueLabelSlugs.has(slug)) return true;
+    }
+    return false;
+  }
+
   async function assertIssueCompletionProofGate(input: {
-    existing: { id: string; companyId: string; status: string; projectId: string | null };
+    existing: {
+      id: string;
+      companyId: string;
+      status: string;
+      projectId: string | null;
+      labelIds?: string[] | null;
+      billingCode?: string | null;
+    };
     updateFields: Record<string, unknown>;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
@@ -3307,9 +3351,10 @@ export function issueRoutes(
       : input.existing.status;
     if (input.existing.status === "done" || nextStatus !== "done") return;
 
-    // C-4 placeholder: read once from the in-process flag. The flag is not
-    // wired to settings yet; the production cutoff happens in ZAL-90.
-    const recoveryPauseFlag = process.env.PAPERCLIP_RECOVERY_PAUSE_CODE_GATES === "true";
+    // ZAL-90 (C-4): runtime flag from the in-process store. Default ON;
+    // env var `PAPERCLIP_RUNTIME_FLAG_RECOVERY_PAUSE_CODE_GATES` overrides
+    // for ops escalation. Board-only PATCH toggles at runtime.
+    const recoveryPauseFlag = runtimeFlags.get("recovery.pause.codeGates");
 
     // ZAL-88: resolve the project's repo-path allowlist from the project
     // row. A project without a registered allowlist rejects every commit
@@ -3322,8 +3367,23 @@ export function issueRoutes(
       projectRepoPaths = project?.codeRepoPaths ?? null;
     }
 
+    // Code-issue heuristic: billing-code prefix is the cheap path; the
+    // label-based path requires resolving the issue's labels to slugs.
+    // We resolve slugs lazily so a non-code issue does not pay the cost.
+    let isCodeIssueResult = isCodeIssue({
+      labelIds: null,
+      billingCode: input.existing.billingCode ?? null,
+    });
+    if (!isCodeIssueResult && input.existing.labelIds && input.existing.labelIds.length > 0) {
+      const companyLabels = await svc.listLabels(input.existing.companyId);
+      const slugById = new Map<string, string>();
+      for (const l of companyLabels) slugById.set(l.id, l.name);
+      isCodeIssueResult = resolveCodeIssueFromLabels(input.existing.labelIds, slugById);
+    }
+
     const verdict = await completionProofsSvc.verifyAtTransition(input.existing.id, {
       recoveryPauseFlag,
+      isCodeIssue: isCodeIssueResult,
       projectRepoPaths,
     });
     if (verdict) {
@@ -5907,6 +5967,26 @@ export function issueRoutes(
       const code = (err as Error & { code?: string }).code ?? "submit_failed";
       if (code === "PeerNotIndependent" || code === "ProofRequired") {
         res.status(409).json({ error: (err as Error).message, code });
+        return;
+      }
+      // ZAL-136: map the Postgres `unique_violation` (23505) on
+      // `issue_completion_proofs_peer_unique_idx` to 409 with code
+      // `PeerProofDuplicate` instead of letting it surface as a 500
+      // that leaks ORM internals. The service tries to supersede the
+      // stale live row first (same actor, same sha, unconsumed); this
+      // catch is the safety net for the cases that can't be auto-resolved
+      // (cross-actor conflicts, race against another writer, or the
+      // existing row is already consumed under C-3 immutability).
+      const cause = (err as { cause?: { code?: string; constraint?: string } }).cause;
+      if (
+        cause?.code === "23505" &&
+        (cause.constraint === undefined ||
+          cause.constraint === "issue_completion_proofs_peer_unique_idx")
+      ) {
+        res.status(409).json({
+          error: "PeerProofDuplicate: a peer-verification proof for this (issue, sha) already exists and cannot be superseded",
+          code: "PeerProofDuplicate",
+        });
         return;
       }
       throw err;

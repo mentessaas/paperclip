@@ -46,6 +46,14 @@ export { issueApprovalService } from "./issue-approvals.js";
 export { issueReferenceService } from "./issue-references.js";
 export { issueRecoveryActionService } from "./issue-recovery-actions.js";
 export { completionProofService } from "./completion-proofs.js";
+export {
+  defaultRuntimeFlagService,
+  KNOWN_RUNTIME_FLAGS,
+  runtimeFlagService,
+  type RuntimeFlagAuditLogger,
+  type RuntimeFlagKey,
+  type RuntimeFlagSnapshot,
+} from "./runtime-flags.js";
 export { taskWatchdogService } from "./task-watchdogs.js";
 export {
   issueIsInTaskWatchdogSubtree,

@@ -30,6 +30,8 @@ import {
   logActivity,
   workTimelineService,
 } from "../services/index.js";
+import { defaultRuntimeFlagService, KNOWN_RUNTIME_FLAGS } from "../services/runtime-flags.js";
+import type { RuntimeFlagKey } from "../services/runtime-flags.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
@@ -514,6 +516,73 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       details: body,
     });
     res.json(company);
+  });
+
+  // ZAL-90 (C-4): board-only kill-switch for the anti-spoofing gate.
+  // Lists every known runtime flag by default; PATCH sets a single flag.
+  // Agents receive 403 (BoardOnly). The flag controls whether the
+  // `in_review -> done` gate pauses transitions on code-bearing issues.
+  const runtimeFlags = defaultRuntimeFlagService();
+  const runtimeFlagKeySchema = z.enum(KNOWN_RUNTIME_FLAGS as [RuntimeFlagKey, ...RuntimeFlagKey[]]);
+
+  router.get("/:companyId/runtime-flags", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    res.json({
+      flags: KNOWN_RUNTIME_FLAGS.map((key) => ({
+        key,
+        value: runtimeFlags.get(key),
+      })),
+      snapshot: runtimeFlags.snapshot(),
+    });
+  });
+
+  router.patch("/:companyId/runtime-flags", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const body = z
+      .object({
+        key: runtimeFlagKeySchema,
+        value: z.boolean(),
+        reason: z.string().max(500).optional(),
+      })
+      .parse(req.body);
+    const actor = getActorInfo(req);
+    // After assertBoard the actor is always a user, never an agent.
+    const boardUserId = actor.actorType === "user" ? actor.actorId ?? "local-board" : "local-board";
+    const previous = runtimeFlags.get(body.key);
+    let snapshot;
+    try {
+      snapshot = await runtimeFlags.set({
+        key: body.key,
+        value: body.value,
+        actorUserId: boardUserId,
+        reason: body.reason ?? null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : "runtime flag update failed" });
+      return;
+    }
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: null,
+      runId: null,
+      agentApiKeyId: null,
+      action: "company.runtime_flag_changed",
+      entityType: "company",
+      entityId: companyId,
+      details: {
+        key: body.key,
+        previousValue: previous,
+        nextValue: body.value,
+        reason: body.reason ?? null,
+      },
+    });
+    res.json({ key: body.key, previousValue: previous, snapshot });
   });
 
   router.post("/:companyId/archive", async (req, res) => {

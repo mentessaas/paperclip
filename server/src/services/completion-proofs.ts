@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueCompletionProofs } from "@paperclipai/db";
 import type {
@@ -209,6 +209,43 @@ export function completionProofService(db: Db) {
       await gitCatFile(payload.peerWorktree, payload.sha);
       await gitLogSha(payload.peerWorktree, payload.sha);
 
+      // ZAL-136: supersede any live peer-verification row for the SAME
+      // (issue, kind, sha) from the SAME actor agent before inserting the
+      // fresh one. The unique index on (issue_id, kind, payload->>'sha')
+      // does not filter by `superseded_at`, so without this step a second
+      // POST in the same 60s freshness window deterministically trips
+      // `23505 issue_completion_proofs_peer_unique_idx` and the route
+      // leaks the ORM error as a 500. C-3: rows with `consumedAtTransitionId`
+      // set are immutable evidence for a transition and MUST NOT be touched;
+      // the WHERE clause filters them out. Cross-agent duplicates are not
+      // superseded here — they are conflicts, and the route maps the
+      // resulting `23505` to 409 `PeerProofDuplicate`.
+      const staleRows = await db
+        .select({ id: issueCompletionProofs.id })
+        .from(issueCompletionProofs)
+        .where(
+          and(
+            eq(issueCompletionProofs.issueId, issue.id),
+            eq(issueCompletionProofs.kind, "peer_verification"),
+            sql`(${issueCompletionProofs.payload}->>'sha') = ${payload.sha}`,
+            eq(issueCompletionProofs.submittedByAgentId, actor.agentId),
+            isNull(issueCompletionProofs.supersededAt),
+            isNull(issueCompletionProofs.consumedAtTransitionId),
+          ),
+        )
+        .orderBy(desc(issueCompletionProofs.submittedAt))
+        .limit(1);
+      if (staleRows.length > 0) {
+        await db
+          .update(issueCompletionProofs)
+          .set({
+            supersededAt: new Date(),
+            supersededByAgentId: actor.agentId,
+            supersededReason: "peer_refresh",
+          })
+          .where(eq(issueCompletionProofs.id, staleRows[0]!.id));
+      }
+
       const row = await db
         .insert(issueCompletionProofs)
         .values({
@@ -265,6 +302,17 @@ export function completionProofService(db: Db) {
       options: {
         recoveryPauseFlag?: boolean;
         /**
+         * ZAL-90 (C-4): the board can toggle `recovery.pause.codeGates` to
+         * pause the gate for code-bearing issues. When the flag is on AND
+         * `isCodeIssue` is true, every `in_review -> done` attempt on this
+         * issue rejects with `409 RecoveryPausedUntilGitGate` until the
+         * board lifts the pause. Non-code issues (no release-gate/qa/
+         * security labels, no `code` billing code) pass through so the
+         * flag never blocks docs, marketing copy, or pure coordination
+         * work.
+         */
+        isCodeIssue?: boolean;
+        /**
          * Optional project-scoped repo-path allowlist. When provided, the
          * commit proof's `repoPath` MUST be in the list, otherwise the
          * gate returns `409 RepoNotRegistered`. ZAL-88: the route resolves
@@ -278,8 +326,11 @@ export function completionProofService(db: Db) {
       message: string;
       proofId?: string;
     }> => {
-      if (options.recoveryPauseFlag) {
-        return { code: "RecoveryPausedUntilGitGate", message: "recovery.handoff paused until the SHA gate ships" };
+      if (options.recoveryPauseFlag && options.isCodeIssue) {
+        return {
+          code: "RecoveryPausedUntilGitGate",
+          message: "recovery.handoff paused until the SHA gate ships (recovery.pause.codeGates is on)",
+        };
       }
       const commits = await db
         .select()
