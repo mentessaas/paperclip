@@ -420,4 +420,55 @@ describeEmbeddedPostgres("completionProofService gate — ZAL-88 + ZAL-89", () =
       ),
     ).rejects.toThrow(/git cat-file/);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ZAL-406: non-code issues are exempt from the SHA gate.
+  // The route resolves `isCodeIssue` from billing-code prefix and label slug
+  // (process/governance/no-code). When the route explicitly passes
+  // `isCodeIssue: false`, the gate MUST return null (pass) without consulting
+  // the commit-proof table. Code-bearing issues (the default, when the option
+  // is omitted) keep the fail-closed SHA gate.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it("ZAL-406 non-code issue (isCodeIssue: false) → gate passes without commit proof", async () => {
+    const { issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    // No commit proof attached. Without ZAL-406, the gate would reject with
+    // `ProofRequired`. With ZAL-406, the explicit `isCodeIssue: false` option
+    // exempts the issue from the SHA gate.
+    const verdict = await svc.verifyAtTransition(issueId, {
+      isCodeIssue: false,
+      projectRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    expect(verdict).toBeNull();
+  });
+
+  it("ZAL-406 code issue (isCodeIssue: true) → SHA gate still requires commit proof", async () => {
+    const { companyId, issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    // No commit proof attached. The issue is explicitly code-bearing, so the
+    // fail-closed gate fires (no relaxation for ZAL-406 on code issues).
+    const verdict = await svc.verifyAtTransition(issueId, {
+      isCodeIssue: true,
+      projectRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("ProofRequired");
+  });
+
+  it("ZAL-406 issue without isCodeIssue option (default) → SHA gate still requires commit proof", async () => {
+    const { issueId } = await insertCompanyAndIssue({
+      codeRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    // Most route callers resolve `isCodeIssue` and pass it explicitly; this
+    // case guards against a future caller that forgets to pass the option
+    // and would otherwise silently exempt every issue.
+    const verdict = await svc.verifyAtTransition(issueId, {
+      projectRepoPaths: ["/zaltyko/canonical/web"],
+    });
+    expect(verdict).not.toBeNull();
+    expect(verdict?.code).toBe("ProofRequired");
+  });
 });

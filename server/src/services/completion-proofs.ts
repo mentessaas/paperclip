@@ -547,6 +547,15 @@ export function completionProofService(db: Db) {
           message: "recovery.handoff paused until the SHA gate ships (recovery.pause.codeGates is on)",
         };
       }
+      // ZAL-406: non-code issues (label `process`/`governance`/`no-code`,
+      // non-code `workMode`, or non-code `originKind`) are explicitly exempt
+      // from the SHA gate. They can close via `operation_verification` proof
+      // (already routed at the issues route layer) or via reviewer evidence on
+      // a `review_no_code` workMode issue. Code-bearing issues keep the
+      // fail-closed SHA gate unchanged.
+      if (options.isCodeIssue === false) {
+        return null;
+      }
       const commits = await db
         .select()
         .from(issueCompletionProofs)
